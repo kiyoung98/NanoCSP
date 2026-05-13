@@ -1,0 +1,18 @@
+# Generated artifacts
+data/*.pt
+runs/
+checkpoints/
+wandb/
+
+# Python caches / venv
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Auxiliary / non-execution material
+docs/
+slowrun/
+OMatG/
+*.pdf
+CLAUDE.md

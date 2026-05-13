@@ -1,0 +1,15 @@
+# Jekyll config for GitHub Pages.
+#
+# To publish:
+#   1. Push the repo to GitHub (public).
+#   2. Settings → Pages → Source: "Deploy from a branch",
+#      Branch: main, Folder: / (root). Save.
+#   3. Pages will be served at https://<your-user>.github.io/<repo>/.
+#
+# README.md is used as the landing page automatically; the Cayman theme
+# renders a banner from `title` + `description` below.
+
+theme: jekyll-theme-cayman
+title: NanoCSP
+description: A slowrun-style benchmark for crystal structure prediction on the MP20 polymorph split.
+show_downloads: false
