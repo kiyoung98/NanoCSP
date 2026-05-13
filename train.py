@@ -1,27 +1,24 @@
 """
-NanoCSP FlowMM baseline trainer.
+NanoCSP baseline trainer.
 
 Single-file CSP baseline for the MP20 polymorph split, evaluated by cRMSE.
-This branch implements FlowMM (arXiv:2406.04713,
-facebookresearch/flowmm @ scripts_model/conf/model/null_params.yaml):
+Architecture is a port of OMatG's `csp_linear_ode_mp_20.yaml`:
 
-  - CSPNet with a 6-dim lattice head, where the lattice manifold is the
-    `lattice_params` parametrization: lengths (positive) + angles
-    (degrees in (59.9, 120.1) bijected to R via sigmoid). Lengths use a
-    LogNormal base; angles use Uniform-via-sigmoid base.
-  - Riemannian flow matching on the product manifold
-    (FlatTorus³_per_atom × R⁶_per_graph). The torus uses the periodic
-    linear interpolant (closest-image geodesic); the lattice_params
-    space is Euclidean-flat under the manifold's chosen inner product.
-  - Sampling: Euler integration on the manifold; fractional coords
-    wrapped to [0, 1) at every step; the 6-D lattice state decoded back
-    to a 3x3 cell via the standard cellpar formula at every step (so
-    the network's IP feature stays meaningful).
+  - CSPNetFull (DiffCSP-style equivariant message passing) with a velocity
+    head (lattice + frac coords). No species head — CSP keeps the
+    composition fixed.
+  - Linear ODE stochastic interpolant (a.k.a. flow matching with no noise):
+      x_t = (1 - t) * x_0 + t * x_1,  v_target = x_1 - x_0
+      loss = MSE(v_pred, v_target)
+    Position uses the periodic linear interpolant (fractional coords on the
+    torus); lattice uses the plain linear interpolant.
+  - Sampling: Euler ODE integration with velocity annealing, fractional
+    coords wrapped to [0, 1) at every step.
 
 The script runs for `--epochs` epochs of training, then writes one CIF
-per test entry to `runs/<run>/test_samples/{idx:05d}.cif`. Following
-FlowMM convention, the EMA shadow weights are swapped in before final
-sampling. `evaluate.py` reads that directory and scores it.
+per test entry to `runs/<run>/test_samples/{idx:05d}.cif` (indexed by
+the order of `mp20_ps_test.pt`). `evaluate.py` reads that directory and
+scores it.
 
 Leaderboard time is the external wall-clock measured by the maintainer
 between script invocation and exit. Pick `epochs` so the run fits the
@@ -58,56 +55,43 @@ class HParams:
     train_file: str = "mp20_ps_train.pt"
     test_file: str = "mp20_ps_test.pt"
 
-    # Model (FlowMM CSPNet; mirrors scripts_model/conf/vectorfield/rfm_cspnet.yaml).
+    # Model (CSPNetFull baseline; mirrors csp_linear_ode_mp_20.yaml)
     hidden_dim: int = 512
     num_layers: int = 6
-    num_freqs: int = 128
-    time_dim: int = 256
-    num_atomic_types: int = 100         # NUM_ATOMIC_TYPES in flowmm
-    max_atom_num: int = 100             # one_hot_dim for represent_num_atoms
+    num_freqs: int = 128            # SinusoidsEmbedding for frac diffs
+    time_dim: int = 256             # SinusoidalTimeEmbeddings dim
+    max_atom_num: int = 100
     layer_norm: bool = True
-    concat_sum_pool: bool = True
-    represent_num_atoms: bool = True
-    represent_angle_edge_to_lattice: bool = True
-    use_log_map: bool = True            # closest-image FlatTorus01.logmap
-    self_edges: bool = False            # remove diagonal from FC graph
+    use_inner_product: bool = True  # ip=True in OMatG yaml
 
-    # FlowMM RFM (lattice_params manifold). Defaults from
-    # scripts_model/conf/model/null_params.yaml + default.yaml/integrate.
-    pos_loss_weight: float = 400.0    # cost_coord
-    cell_loss_weight: float = 1.0     # cost_lattice
-    correct_com_motion: bool = True   # f_manifold.proju subtracts the mean
-    integration_steps: int = 1000
-    small_time: float = 0.0
-    big_time: float = 1.0
-    inference_anneal_slope: float = 0.0   # disabled in FlowMM null_params
-    inference_anneal_offset: float = 0.0
-    angle_low_deg: float = 59.9            # FlowMM LatticeParams bounds
-    angle_high_deg: float = 120.1
+    # Flow matching (linear ODE)
+    pos_velocity_annealing: float = 10.182659004291072
+    cell_velocity_annealing: float = 1.824475401606087
+    pos_loss_weight: float = 0.9994149341846618
+    cell_loss_weight: float = 0.0005850658153382233
+    correct_com_motion: bool = True  # for fractional coords; FlowMM-style
+    integration_steps: int = 210
+    small_time: float = 1e-3
+    big_time: float = 1.0 - 1e-3
 
-    # MP20-PS lattice base distribution (LogNormal lengths + Uniform-via-sigmoid angles).
-    # Length stats imported from OMatG mp_20 (matches what FlowMM would compute).
+    # MP20-PS lattice base distribution (LogNormal lengths + Uniform[60,120] angles)
+    # Numbers from OMatG omg/sampler/cell_distributions.py for "mp_20".
     mp20_length_log_means: tuple = (1.575442910194397, 1.7017393112182617, 1.9781638383865356)
     mp20_length_log_stds: tuple = (0.24437622725963593, 0.26526379585266113, 0.3535512685775757)
 
-    # Optimizer / training. Method-specific hyperparameters (AdamW lr=3e-4,
-    # weight_decay=0, EMA decay=0.999, gradient_clip 0.5 by value,
-    # batch_size=256, CosineAnnealingLR with eta_min=1e-5) match FlowMM
-    # scripts_model/conf/default.yaml. CosineAnnealingLR.T_max is linked
-    # to `epochs`. The 12 h honor-system budget covers training + (optional)
-    # in-line validation + final test sampling (heavy: 1000-step
-    # integration) — tune `epochs` so the run fits.
+    # Optimizer / training. Calibration on a single RTX 3090 (24 GB) with
+    # hidden_dim=512, batch_size=256 runs at ~118 ms/step (106 steps/epoch
+    # ≈ 12.5 s/epoch). epochs=3400 → ~11.8 h training + ~6 min final test
+    # sampling fits the 12 h honor-system budget.
     batch_size: int = 256
-    lr: float = 3e-4
-    weight_decay: float = 0.0
-    epochs: int = 2800
+    lr: float = 6.689636445843722e-4
+    epochs: int = 3400
     grad_clip: float = 0.5
-    seed: int = 42
-    ema_decay: float = 0.999
-    lr_eta_min: float = 1e-5
+    warmup_steps: int = 200
+    weight_decay: float = 0.0
+    seed: int = 0
 
-    # Final test sampling. FlowMM convention: EMA shadow weights are
-    # swapped in before sampling. Writes one CIF per test entry to
+    # Final test sampling. Writes one CIF per test entry to
     # runs/<run>/test_samples/{idx:05d}.cif.
     test_sample_seed: int = 0
     test_sample_batch_size: int = 64
@@ -115,7 +99,7 @@ class HParams:
     # Logging / IO
     log_every: int = 50              # steps
     out_dir: str = "./runs"
-    run_name: str = "flowmm"
+    run_name: str = "baseline"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Sanity / dev knobs
@@ -163,8 +147,21 @@ def collate_pyg(batch: list[dict]) -> dict:
 # ============================================================================
 
 
+class SinusoidalTimeEmbeddings(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, time: torch.Tensor) -> torch.Tensor:
+        half_dim = self.dim // 2
+        scale = math.log(10000) / (half_dim - 1)
+        freqs = torch.exp(torch.arange(half_dim, device=time.device) * -scale)
+        emb = time[:, None] * freqs[None, :]
+        return torch.cat((emb.sin(), emb.cos()), dim=-1)
+
+
 class SinusoidsEmbedding(nn.Module):
-    """Frequency embedding for frac-diff vectors. Same in DiffCSP and FlowMM."""
+    """Frequency embedding for frac-diff vectors (DiffCSP convention)."""
 
     def __init__(self, n_frequencies: int = 128, n_space: int = 3):
         super().__init__()
@@ -183,43 +180,16 @@ class SinusoidsEmbedding(nn.Module):
         return torch.cat((emb.sin(), emb.cos()), dim=-1)
 
 
-def flat_torus_logmap(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Closest-image periodic distance on T^d (FlowMM `FlatTorus01.logmap`).
-
-    Equivalent to `((y - x + 0.5) % 1.0) - 0.5`, returns values in
-    [-0.5, 0.5)^d. The atan2 form mirrors the FlowMM source verbatim.
-    """
-    z = 2 * math.pi * (y - x)
-    return torch.atan2(torch.sin(z), torch.cos(z)) / (2 * math.pi)
-
-
 class CSPLayer(nn.Module):
-    """FlowMM CSPLayer. Edge features:
-        [unit_dots(3), hi, hj, num_atoms_emb(hidden_dim), lattice_flat(6),
-         dis_emb(frac_diff)]
-    The 6-D lattice_flat goes in directly (no L L^T); the 3-D unit_dots
-    encodes the angle between cartesian edge vector and lattice rows.
+    """Single message-passing block. Equivariant under translations along
+    the lattice basis (frac_diff is taken modulo 1).
     """
 
-    def __init__(
-        self, hidden_dim: int, dis_emb: SinusoidsEmbedding, ln: bool,
-        dim_l: int, represent_num_atoms: bool, max_atom_num: int,
-        represent_angle_edge_to_lattice: bool,
-    ):
+    def __init__(self, hidden_dim: int, dis_emb: SinusoidsEmbedding, ln: bool, ip: bool):
         super().__init__()
         self.dis_emb = dis_emb
-        self.represent_num_atoms = represent_num_atoms
-        # FlowMM declares num_atom_embedding per-layer (not shared).
-        if represent_num_atoms:
-            self.num_atom_embedding = nn.Linear(max_atom_num, hidden_dim, bias=False)
-        else:
-            self.num_atom_embedding = None
-        self.represent_angle_edge_to_lattice = represent_angle_edge_to_lattice
-
-        angle_edge_dims = 3 if represent_angle_edge_to_lattice else 0
-        num_hidden_vecs = 3 if represent_num_atoms else 2  # hi, hj (+num_atoms emb)
-        edge_in = angle_edge_dims + hidden_dim * num_hidden_vecs + dim_l + dis_emb.dim
-
+        self.ip = ip
+        edge_in = hidden_dim * 2 + 9 + dis_emb.dim
         self.edge_mlp = nn.Sequential(
             nn.Linear(edge_in, hidden_dim),
             nn.SiLU(),
@@ -236,168 +206,106 @@ class CSPLayer(nn.Module):
         if ln:
             self.layer_norm = nn.LayerNorm(hidden_dim)
 
-    @staticmethod
-    def _unit_dots_ltlf(non_zscored_lattice: torch.Tensor, edge2graph: torch.Tensor,
-                       frac_diff: torch.Tensor) -> torch.Tensor:
-        ltl = non_zscored_lattice @ non_zscored_lattice.transpose(-1, -2)  # (B, 3, 3)
-        dots = torch.einsum("...ij,...j->...i", ltl[edge2graph], frac_diff)  # (E, 3)
-        unit_dots = dots / (dots.norm(dim=-1, keepdim=True) + 1e-12)
-        return unit_dots
-
     def forward(
         self,
         h: torch.Tensor,
-        lattice_flat: torch.Tensor,            # (B, dim_l) — 6-D for lattice_params
-        non_zscored_lattice: torch.Tensor | None,  # (B, 3, 3) decoded cell
+        frac_coords: torch.Tensor,
+        lattices: torch.Tensor,
         edge_index: torch.Tensor,
         edge2graph: torch.Tensor,
-        frac_diff: torch.Tensor,                # (E, 3) closest-image
-        num_atoms_one_hot: torch.Tensor | None,  # (B, max_atom_num)
+        frac_diff: torch.Tensor,
     ) -> torch.Tensor:
         h_in = h
         if self.ln:
             h = self.layer_norm(h_in)
-
-        edge_features = []
-        if self.represent_angle_edge_to_lattice:
-            unit_dots = self._unit_dots_ltlf(non_zscored_lattice, edge2graph, frac_diff)
-            edge_features.append(unit_dots)
-
-        frac_diff_emb = self.dis_emb(frac_diff)
+        # Edge features: sender, receiver, lattice IP, frac diff embedding.
         hi, hj = h[edge_index[0]], h[edge_index[1]]
-        lattice_flat_edges = lattice_flat[edge2graph]
-        edge_features.extend([hi, hj, lattice_flat_edges, frac_diff_emb])
-
-        if self.represent_num_atoms:
-            num_atoms_emb = self.num_atom_embedding(num_atoms_one_hot)[edge2graph]
-            edge_features.append(num_atoms_emb)
-
-        e = self.edge_mlp(torch.cat(edge_features, dim=1))
+        if self.ip:
+            lat_ip = lattices @ lattices.transpose(-1, -2)
+        else:
+            lat_ip = lattices
+        lat_ip_edges = lat_ip.view(-1, 9)[edge2graph]
+        frac_diff_emb = self.dis_emb(frac_diff)
+        e = self.edge_mlp(torch.cat([hi, hj, lat_ip_edges, frac_diff_emb], dim=1))
+        # Aggregate edges back to nodes.
         agg = scatter(e, edge_index[0], dim=0, reduce="mean", dim_size=h.shape[0])
         out = self.node_mlp(torch.cat([h, agg], dim=1))
         return h_in + out
 
 
 class CSPNetFull(nn.Module):
-    """FlowMM CSPNet (lattice_params variant). Predicts `pos_v` (per-atom, 3)
-    on the torus and `cell_v` (per-graph, 6) in the lattice_params tangent
-    space (3 length-velocities + 3 angle-uncon-velocities).
+    """Velocity-field GNN. Predicts `pos_v` (per-atom, 3) and `cell_v`
+    (per-graph, 3x3). Output is in the same fractional / lattice space as
+    the inputs, so it can be fed directly into the linear interpolant
+    targets.
     """
 
     def __init__(self, hp: HParams):
         super().__init__()
         self.hp = hp
         self.dis_emb = SinusoidsEmbedding(n_frequencies=hp.num_freqs)
-        # FlowMM: time emb = Linear(1, time_dim, bias=False), NOT sinusoidal.
-        self.time_emb = nn.Linear(1, hp.time_dim, bias=False)
-        # FlowMM: atom emb = Linear on one-hot, NOT nn.Embedding lookup.
-        self.node_embedding = nn.Linear(hp.num_atomic_types, hp.hidden_dim, bias=False)
-        self.atom_latent_emb = nn.Linear(hp.hidden_dim + hp.time_dim, hp.hidden_dim, bias=False)
-        dim_l = 6  # lattice_params: lengths(3) + angles_uncon(3)
-        self.layers = nn.ModuleList([
-            CSPLayer(
-                hp.hidden_dim, self.dis_emb, hp.layer_norm,
-                dim_l=dim_l,
-                represent_num_atoms=hp.represent_num_atoms,
-                max_atom_num=hp.max_atom_num,
-                represent_angle_edge_to_lattice=hp.represent_angle_edge_to_lattice,
-            )
-            for _ in range(hp.num_layers)
-        ])
+        self.time_emb = SinusoidalTimeEmbeddings(hp.time_dim)
+        self.node_embedding = nn.Embedding(hp.max_atom_num, hp.hidden_dim)
+        self.atom_latent_emb = nn.Linear(hp.hidden_dim + hp.time_dim, hp.hidden_dim)
+        self.layers = nn.ModuleList(
+            [CSPLayer(hp.hidden_dim, self.dis_emb, hp.layer_norm, hp.use_inner_product)
+             for _ in range(hp.num_layers)]
+        )
         if hp.layer_norm:
             self.final_layer_norm = nn.LayerNorm(hp.hidden_dim)
         self.coord_out = nn.Linear(hp.hidden_dim, 3, bias=False)
-        # FlowMM concat_sum_pool: lattice head input dim doubles when on.
-        self.lattice_out = nn.Linear(
-            (2 if hp.concat_sum_pool else 1) * hp.hidden_dim, dim_l,
-        )
-        # FlowMM also declares a type-prediction head (unused for CSP, but
-        # we keep it so the param count and state_dict shape match).
-        self.type_out = nn.Linear(hp.hidden_dim, hp.num_atomic_types)
+        self.lattice_out = nn.Linear(hp.hidden_dim, 9, bias=False)
 
     def gen_edges(
         self,
         num_atoms: torch.Tensor,
         frac_coords: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """FlowMM 'fc' edge style with self_edges configurable + log-map frac_diff."""
-        if self.hp.self_edges:
-            blocks = [torch.ones(int(n), int(n), device=num_atoms.device) for n in num_atoms]
-        else:
-            blocks = [
-                torch.ones(int(n), int(n), device=num_atoms.device)
-                - torch.eye(int(n), device=num_atoms.device)
-                for n in num_atoms
-            ]
+        """Fully-connected graph within each structure (edge_style='fc')."""
+        blocks = [torch.ones(int(n), int(n), device=num_atoms.device) for n in num_atoms]
         adj = torch.block_diag(*blocks)
         edge_index, _ = dense_to_sparse(adj)
-        if self.hp.use_log_map:
-            frac_diff = flat_torus_logmap(frac_coords[edge_index[0]], frac_coords[edge_index[1]])
-        else:
-            frac_diff = (frac_coords[edge_index[1]] - frac_coords[edge_index[0]]) % 1.0
+        # Frac diff wrapped to [0, 1) (DiffCSP convention).
+        frac_diff = (frac_coords[edge_index[1]] - frac_coords[edge_index[0]]) % 1.0
         return edge_index, frac_diff
 
     def forward(
         self,
-        t: torch.Tensor,                  # (B,) in [0, 1]
-        atom_types: torch.Tensor,         # (sum_atoms,) integer atomic numbers
-        frac_coords: torch.Tensor,        # (sum_atoms, 3) in [0, 1)
-        lattice_params: torch.Tensor,     # (B, 6) lengths + angles_uncon
-        num_atoms: torch.Tensor,          # (B,)
-        node2graph: torch.Tensor,         # (sum_atoms,)
+        t: torch.Tensor,        # (B,) in [0, 1]
+        atom_types: torch.Tensor,
+        frac_coords: torch.Tensor,
+        lattices: torch.Tensor,
+        num_atoms: torch.Tensor,
+        node2graph: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns (pos_v, cell_v): shapes (sum_atoms, 3) and (B, 6)."""
+        """Returns (pos_v, cell_v): shapes (sum_atoms, 3) and (B, 3, 3)."""
         edge_index, frac_diff = self.gen_edges(num_atoms, frac_coords)
         edge2graph = node2graph[edge_index[0]]
 
-        # One-hot atom encoding (FlowMM convention; species_shift=1).
-        atom_one_hot = F.one_hot(
-            (atom_types - 1).clamp_min(0), num_classes=self.hp.num_atomic_types,
-        ).to(dtype=lattice_params.dtype)
-        h = self.node_embedding(atom_one_hot)
-
-        # Linear time projection (FlowMM-specific). t_emb shape: (B, time_dim).
-        t_emb = self.time_emb(t.view(-1, 1))
-        t_per_atom = t_emb[node2graph]
+        # OMatG node embedding indexes from atomic_number - 1 (species_shift=1).
+        h = self.node_embedding((atom_types - 1).clamp_min(0))
+        t_emb = self.time_emb(t)                              # (B, time_dim)
+        t_per_atom = t_emb[node2graph]                        # (sum_atoms, time_dim)
         h = self.atom_latent_emb(torch.cat([h, t_per_atom], dim=1))
 
-        # Decode 6-D lattice_params → 3x3 cell for unit_dots edge feature.
-        non_zscored_lattice = (
-            params_uncon_to_lattice(lattice_params, self.hp.angle_low_deg, self.hp.angle_high_deg)
-            if self.hp.represent_angle_edge_to_lattice else None
-        )
-        # One-hot num_atoms (FlowMM clamps to one_hot_dim=100).
-        if self.hp.represent_num_atoms:
-            num_atoms_one_hot = F.one_hot(
-                num_atoms.clamp_max(self.hp.max_atom_num - 1),
-                num_classes=self.hp.max_atom_num,
-            ).to(dtype=lattice_params.dtype)
-        else:
-            num_atoms_one_hot = None
-
         for layer in self.layers:
-            h = layer(
-                h, lattice_params, non_zscored_lattice, edge_index, edge2graph,
-                frac_diff, num_atoms_one_hot,
-            )
+            h = layer(h, frac_coords, lattices, edge_index, edge2graph, frac_diff)
 
         if self.hp.layer_norm:
             h = self.final_layer_norm(h)
 
-        pos_v = self.coord_out(h)                              # (sum_atoms, 3)
-        if self.hp.concat_sum_pool:
-            graph_h = torch.cat([
-                scatter(h, node2graph, dim=0, reduce="mean"),
-                scatter(h, node2graph, dim=0, reduce="sum"),
-            ], dim=-1)
-        else:
-            graph_h = scatter(h, node2graph, dim=0, reduce="mean")
-        cell_v = self.lattice_out(graph_h)                     # (B, 6)
+        pos_v = self.coord_out(h)                             # (sum_atoms, 3)
+        graph_h = scatter(h, node2graph, dim=0, reduce="mean")
+        cell_v = self.lattice_out(graph_h).view(-1, 3, 3)     # (B, 3, 3)
+        if self.hp.use_inner_product:
+            # OMatG multiplies the lattice output by the current lattice
+            # (matches DiffCSP); keeps the velocity in cell-relative space.
+            cell_v = torch.einsum("bij,bjk->bik", cell_v, lattices)
         return pos_v, cell_v
 
 
 # ============================================================================
-# FlowMM RFM on the (FlatTorus³ × R⁶_lattice_params) product manifold.
+# Linear ODE flow matching (no score, no noise).
 # ============================================================================
 
 
@@ -424,95 +332,10 @@ def interpolate_frac(t_atom: torch.Tensor, x_0: torch.Tensor, x_1: torch.Tensor)
     return wrap_unit(x_t), sep                        # v_target = sep
 
 
-# ----------------------------------------------------------------------------
-# Lattice parametrization (lengths + angles_uncon).
-#
-# Port of `flowmm.rfm.manifolds.lattice_params.LatticeParams`. Angles in
-# (low, high) degrees are bijected to R via the inverse-CDF of the
-# Uniform[low, high] distribution (sigmoid):
-#   uncon = logit((angle_deg - low) / (high - low))
-#   angle_deg = low + (high - low) * sigmoid(uncon)
-# Lengths flow in raw positive R³ space (LogNormal base).
-# ----------------------------------------------------------------------------
-
-
-def angles_deg_to_uncon(angles_deg: torch.Tensor, low: float, high: float) -> torch.Tensor:
-    u = (angles_deg - low) / (high - low)
-    u = u.clamp(1e-6, 1.0 - 1e-6)
-    return torch.log(u) - torch.log1p(-u)
-
-
-def angles_uncon_to_deg(angles_uncon: torch.Tensor, low: float, high: float) -> torch.Tensor:
-    return low + (high - low) * torch.sigmoid(angles_uncon)
-
-
-def lattice_matrix_to_lengths_angles(L: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """L: (B, 3, 3) with rows = basis vectors. Returns (lengths, angles_deg)."""
-    a, b, c = L[:, 0], L[:, 1], L[:, 2]
-    la = torch.linalg.norm(a, dim=-1)
-    lb = torch.linalg.norm(b, dim=-1)
-    lc = torch.linalg.norm(c, dim=-1)
-    cos_alpha = (b * c).sum(-1) / (lb * lc + 1e-12)
-    cos_beta = (a * c).sum(-1) / (la * lc + 1e-12)
-    cos_gamma = (a * b).sum(-1) / (la * lb + 1e-12)
-    angles_rad = torch.stack([
-        torch.acos(cos_alpha.clamp(-1.0, 1.0)),
-        torch.acos(cos_beta.clamp(-1.0, 1.0)),
-        torch.acos(cos_gamma.clamp(-1.0, 1.0)),
-    ], dim=-1)
-    return torch.stack([la, lb, lc], dim=-1), torch.rad2deg(angles_rad)
-
-
-def lattice_params_to_matrix_torch(lengths: torch.Tensor, angles_deg: torch.Tensor) -> torch.Tensor:
-    """Port of DiffCSP/flowmm `lattice_params_to_matrix_torch` (used by
-    FlowMM at decode time). Note: this convention places vector_a in the
-    (x, 0, z) plane via `sin(β)/cos(β)`, and vector_c along z. It is NOT
-    the same orientation as ASE/standard cellpar_to_cell, but matches
-    what FlowMM uses end-to-end.
-    """
-    angles_r = torch.deg2rad(angles_deg)
-    coses = torch.cos(angles_r)
-    sins = torch.sin(angles_r)
-    val = (coses[:, 0] * coses[:, 1] - coses[:, 2]) / (sins[:, 0] * sins[:, 1])
-    val = torch.clamp(val, -1.0, 1.0)
-    gamma_star = torch.arccos(val)
-    zero = torch.zeros_like(lengths[:, 0])
-    vector_a = torch.stack([lengths[:, 0] * sins[:, 1], zero, lengths[:, 0] * coses[:, 1]], dim=1)
-    vector_b = torch.stack([
-        -lengths[:, 1] * sins[:, 0] * torch.cos(gamma_star),
-        lengths[:, 1] * sins[:, 0] * torch.sin(gamma_star),
-        lengths[:, 1] * coses[:, 0],
-    ], dim=1)
-    vector_c = torch.stack([zero, zero, lengths[:, 2]], dim=1)
-    return torch.stack([vector_a, vector_b, vector_c], dim=1)
-
-
-def lattice_to_params_uncon(L: torch.Tensor, low: float, high: float) -> torch.Tensor:
-    """3x3 cell → 6-vector [lengths, angles_uncon]."""
-    lengths, angles_deg = lattice_matrix_to_lengths_angles(L)
-    angles_uncon = angles_deg_to_uncon(angles_deg, low, high)
-    return torch.cat([lengths, angles_uncon], dim=-1)
-
-
-def params_uncon_to_lattice(params: torch.Tensor, low: float, high: float) -> torch.Tensor:
-    """6-vector [lengths, angles_uncon] → 3x3 cell."""
-    lengths = params[:, :3]
-    angles_uncon = params[:, 3:]
-    angles_deg = angles_uncon_to_deg(angles_uncon, low, high)
-    return lattice_params_to_matrix_torch(lengths, angles_deg)
-
-
-def interpolate_cell_params(
-    t_graph: torch.Tensor, p_0: torch.Tensor, p_1: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Euclidean linear interpolant in 6-D lattice_params space.
-
-    The FlowMM `LatticeParams` manifold inherits from `Euclidean`, so the
-    geodesic interpolant collapses to plain linear interpolation and the
-    velocity is constant.
-    """
-    p_t = (1.0 - t_graph) * p_0 + t_graph * p_1
-    return p_t, p_1 - p_0
+def interpolate_cell(t_graph: torch.Tensor, c_0: torch.Tensor, c_1: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Plain linear interpolant on lattice matrices."""
+    c_t = (1.0 - t_graph) * c_0 + t_graph * c_1
+    return c_t, c_1 - c_0
 
 
 # ============================================================================
@@ -524,38 +347,39 @@ def sample_pos_base(num_atoms: torch.Tensor, device: torch.device) -> torch.Tens
     return torch.rand(int(num_atoms.sum()), 3, device=device)
 
 
-class InformedLatticeDistribution:
-    """FlowMM `LatticeParams` base distribution: LogNormal lengths +
-    Uniform[low, high] angles bijected to R via inverse-sigmoid.
+def _cellpar_to_matrix(lengths: np.ndarray, angles_deg: np.ndarray) -> np.ndarray:
+    """Convert (a, b, c, α, β, γ) → 3×3 lattice matrix (rows = basis vectors).
 
-    `sample` returns a 3x3 cell matrix (used by evaluate.py and by main
-    for the OMatG-style API). `sample_params` returns the raw 6-D
-    representation used during training/sampling on the manifold.
+    Standard crystallographic convention; matches ASE's cellpar_to_cell up to
+    floating-point roundoff for our inputs.
     """
+    a, b, c = lengths
+    al, be, ga = np.deg2rad(angles_deg)
+    cos_al, cos_be, cos_ga = math.cos(al), math.cos(be), math.cos(ga)
+    sin_ga = math.sin(ga)
+    ax, ay, az = a, 0.0, 0.0
+    bx, by, bz = b * cos_ga, b * sin_ga, 0.0
+    cx = c * cos_be
+    cy = c * (cos_al - cos_be * cos_ga) / sin_ga
+    cz = math.sqrt(max(c * c - cx * cx - cy * cy, 0.0))
+    return np.array([[ax, ay, az], [bx, by, bz], [cx, cy, cz]], dtype=np.float64)
 
-    def __init__(self, log_means: tuple, log_stds: tuple,
-                 angle_low_deg: float = 59.9, angle_high_deg: float = 120.1):
+
+class InformedLatticeDistribution:
+    """LogNormal lengths + uniform angles in [60°, 120°] (FlowMM/OMatG)."""
+
+    def __init__(self, log_means: tuple, log_stds: tuple):
         self.log_means = torch.tensor(log_means, dtype=torch.float32)
         self.log_stds = torch.tensor(log_stds, dtype=torch.float32)
-        self.angle_low_deg = angle_low_deg
-        self.angle_high_deg = angle_high_deg
-
-    def sample_params(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        # LogNormal lengths (no sort: FlowMM does not sort).
-        normal = torch.randn(batch_size, 3, device=device) * self.log_stds.to(device) + self.log_means.to(device)
-        lengths = torch.exp(normal)
-        # Angles: sample uniform in (low, high) deg, then bijection-invert
-        # to R. This is identical to drawing the unconstrained angle from
-        # the pushforward of Uniform under the logit transform, which is
-        # what FlowMM's UnconstrainedCompact does internally.
-        u = torch.rand(batch_size, 3, device=device)
-        angles_deg = self.angle_low_deg + (self.angle_high_deg - self.angle_low_deg) * u
-        angles_uncon = angles_deg_to_uncon(angles_deg, self.angle_low_deg, self.angle_high_deg)
-        return torch.cat([lengths, angles_uncon], dim=-1)
 
     def sample(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        params = self.sample_params(batch_size, device)
-        return params_uncon_to_lattice(params, self.angle_low_deg, self.angle_high_deg)
+        # LogNormal: exp(N(μ, σ)). We sort lengths (a ≤ b ≤ c) per OMatG's
+        # parameter convention.
+        normal = torch.randn(batch_size, 3) * self.log_stds + self.log_means
+        lengths = torch.exp(normal).sort(dim=-1).values.numpy()
+        angles = (np.random.rand(batch_size, 3) * 60.0 + 60.0)
+        cells = np.stack([_cellpar_to_matrix(l, a) for l, a in zip(lengths, angles)], axis=0)
+        return torch.from_numpy(cells).float().to(device)
 
 
 # ============================================================================
@@ -569,62 +393,43 @@ def flow_matching_loss(
     base_lattice: InformedLatticeDistribution,
     hp: HParams,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Single training step loss for FlowMM RFM on
-    (FlatTorus³_per_atom × R⁶_lattice_params).
-    """
+    """Single training step loss for linear-ODE flow matching."""
     device = batch["atom_types"].device
     num_atoms = batch["num_atoms"]
     node2graph = batch["node2graph"]
     B = num_atoms.shape[0]
 
+    # Random times (clamped to [small_time, big_time] like OMatG).
     t = torch.rand(B, device=device) * (hp.big_time - hp.small_time) + hp.small_time
-    t_graph = t.view(B, 1)
-    t_atom = t[node2graph].unsqueeze(-1)
+    t_graph = t.view(B, 1, 1)
+    t_atom = t[node2graph].unsqueeze(-1)  # (sum_atoms, 1)
 
-    # Base samples (x_0): uniform on torus + LatticeParams base.
+    # Base samples.
     x_0_pos = sample_pos_base(num_atoms, device)
-    x_0_params = base_lattice.sample_params(B, device)
+    x_0_cell = base_lattice.sample(B, device)
 
-    # Data target (x_1): convert the data 3x3 cell into 6-D params.
-    x_1_params = lattice_to_params_uncon(
-        batch["lattices"], hp.angle_low_deg, hp.angle_high_deg,
-    )
-
+    # Targets.
     x_t_pos, v_target_pos = interpolate_frac(t_atom, x_0_pos, batch["frac_coords"])
-    x_t_params, v_target_params = interpolate_cell_params(t_graph, x_0_params, x_1_params)
+    x_t_cell, v_target_cell = interpolate_cell(t_graph, x_0_cell, batch["lattices"])
 
-    # CoM motion correction (FlatTorus.proju subtracts the per-graph mean).
+    # CoM motion correction on positions (FlowMM-style): subtract per-graph
+    # mean of v_target_pos before computing the loss, since the
+    # translationally invariant model can't predict it anyway.
     if hp.correct_com_motion:
         mean_v = scatter(v_target_pos, node2graph, dim=0, reduce="mean")[node2graph]
         v_target_pos = v_target_pos - mean_v
 
-    # FlowMM's CSPNet takes the 6-D lattice_params directly (it decodes to
-    # a 3x3 cell internally for the unit_dots edge feature).
     pos_v_pred, cell_v_pred = model(
         t,
         batch["atom_types"],
         x_t_pos,
-        x_t_params,
+        x_t_cell,
         num_atoms,
         node2graph,
     )
 
-    # FlowMM loss (model_pl.py:rfm_loss_fn:664-679) uses
-    #   manifold.inner(x_t, diff, diff).mean() / dim_per_atom
-    # which on Euclidean / FlatTorus reduces to a per-graph squared-error
-    # sum, averaged over graphs, divided by the per-atom dimensionality.
-    # This is NOT the same as F.mse_loss (which averages over all flat
-    # elements): atoms in larger graphs get implicitly more weight in MSE
-    # and less weight in FlowMM. Reproducing the FlowMM convention here.
-    diff_pos = pos_v_pred - v_target_pos                       # (sum_atoms, 3)
-    pos_per_atom_sq = (diff_pos ** 2).sum(dim=-1)              # (sum_atoms,)
-    pos_per_graph_sq = scatter(pos_per_atom_sq, node2graph,
-                               dim=0, reduce="sum", dim_size=B)  # (B,)
-    pos_loss = pos_per_graph_sq.mean() / 3.0                    # /dim_f_per_atom
-
-    diff_cell = cell_v_pred - v_target_params                   # (B, 6)
-    cell_loss = (diff_cell ** 2).sum(dim=-1).mean() / 6.0       # /dims.l
-
+    pos_loss = F.mse_loss(pos_v_pred, v_target_pos)
+    cell_loss = F.mse_loss(cell_v_pred, v_target_cell)
     loss = hp.pos_loss_weight * pos_loss + hp.cell_loss_weight * cell_loss
     metrics = {
         "loss": loss.detach().item(),
@@ -643,15 +448,14 @@ def sample_structures(
     hp: HParams,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Euler integration on (FlatTorus³ × R⁶_lattice_params). Returns
-    (frac_coords, 3x3 lattices)."""
+    """Euler ODE sampler. Returns (frac_coords, lattices) for the batch."""
     model.eval()
     B = num_atoms_batch.shape[0]
     node2graph = torch.repeat_interleave(
         torch.arange(B, device=device), num_atoms_batch
     )
     x_pos = sample_pos_base(num_atoms_batch, device)
-    x_params = base_lattice.sample_params(B, device)
+    x_cell = base_lattice.sample(B, device)
 
     n_steps = hp.integration_steps
     times = torch.linspace(hp.small_time, hp.big_time, n_steps + 1, device=device)
@@ -660,17 +464,13 @@ def sample_structures(
         dt = times[k + 1] - times[k]
         t_batch = t.expand(B)
         v_pos, v_cell = model(
-            t_batch, atom_types_batch, wrap_unit(x_pos), x_params,
-            num_atoms_batch, node2graph,
+            t_batch, atom_types_batch, wrap_unit(x_pos), x_cell, num_atoms_batch, node2graph
         )
-        # Optional inference annealing factor (1 + c * t + b); FlowMM
-        # null_params disables it (slope=offset=0 → factor=1).
-        anneal = 1.0 + hp.inference_anneal_slope * t + hp.inference_anneal_offset
-        x_pos = x_pos + dt * anneal * v_pos
-        x_params = x_params + dt * anneal * v_cell
+        # Velocity annealing factor as in OMatG.
+        x_pos = x_pos + dt * (1.0 + hp.pos_velocity_annealing * t) * v_pos
+        x_cell = x_cell + dt * (1.0 + hp.cell_velocity_annealing * t) * v_cell
 
-    x_cell_final = params_uncon_to_lattice(x_params, hp.angle_low_deg, hp.angle_high_deg)
-    return wrap_unit(x_pos), x_cell_final
+    return wrap_unit(x_pos), x_cell
 
 
 # ============================================================================
@@ -684,6 +484,14 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def cosine_lr(step: int, total_steps: int, warmup: int, base_lr: float) -> float:
+    """Linear warmup + cosine decay to 0 (slowrun-compatible LR schedule)."""
+    if step < warmup:
+        return base_lr * (step + 1) / max(1, warmup)
+    progress = (step - warmup) / max(1, total_steps - warmup)
+    return base_lr * 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
 
 
 def _write_test_samples(
@@ -700,8 +508,8 @@ def _write_test_samples(
     record — ground-truth frac_coords / lattice are never touched here
     (leakage prevention; those are read by evaluate.py for matching).
 
-    Caller is responsible for swapping in EMA weights before calling
-    this (FlowMM convention: final evaluation uses EMA shadow).
+    Writes `{idx:05d}.cif` files (indexed by the order of the test split)
+    into `out_dir / "test_samples"`. Returns that path.
     """
     from pymatgen.core import Lattice, Structure  # noqa: PLC0415
 
@@ -745,59 +553,6 @@ def _write_test_samples(
         cursor_atom += n_atoms_chunk
     print0(f"[test] wrote {cif_idx} CIFs")
     return samples_dir
-
-
-class EMAState:
-    """Minimal exponential-moving-average shadow weights, FlowMM convention.
-
-    Mirrors `manifm.ema.EMA` (the EMA module used by ~/refs/flowmm via
-    model_pl.py:21 `from manifm.ema import EMA`):
-        decay_t = min(decay, (1 + t) / (10 + t))
-    so the shadow weights track the live model closely for ~30 early
-    updates, then settle to the configured decay (0.999). Using a
-    constant decay from step 0 leaves the shadow weights stuck near
-    their initialization for the first hundred-or-so steps and would
-    produce meaningless EMA-based validation early in training.
-
-    `apply_to(model)` swaps the shadow weights into the model and
-    returns the original parameters; `restore(model, backup)` undoes
-    the swap.
-    """
-
-    def __init__(self, model: nn.Module, decay: float):
-        self.decay = decay
-        self.num_updates = 0
-        self.shadow = {
-            name: p.detach().clone() for name, p in model.named_parameters()
-            if p.requires_grad
-        }
-
-    @torch.no_grad()
-    def update(self, model: nn.Module) -> None:
-        self.num_updates += 1
-        # FlowMM/manifm.ema decay warmup: ramps from ~1/11 at t=1 toward
-        # `self.decay` as t grows (crosses 0.99 around t ≈ 990 for
-        # decay=0.999, but already > 0.9 by t=90).
-        d = min(self.decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
-        for name, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-            self.shadow[name].mul_(d).add_(p.detach(), alpha=1.0 - d)
-
-    @torch.no_grad()
-    def apply_to(self, model: nn.Module) -> dict[str, torch.Tensor]:
-        backup = {}
-        for name, p in model.named_parameters():
-            if name in self.shadow:
-                backup[name] = p.detach().clone()
-                p.copy_(self.shadow[name])
-        return backup
-
-    @torch.no_grad()
-    def restore(self, model: nn.Module, backup: dict[str, torch.Tensor]) -> None:
-        for name, p in model.named_parameters():
-            if name in backup:
-                p.copy_(backup[name])
 
 
 def main():
@@ -853,24 +608,15 @@ def main():
         except Exception as e:
             print0(f"[model] torch.compile failed, continuing eager: {e}")
 
-    # Optimizer (FlowMM: AdamW lr=3e-4, weight_decay=0).
-    optimizer = torch.optim.AdamW(model.parameters(), lr=hp.lr, weight_decay=hp.weight_decay)
-    # FlowMM: CosineAnnealingLR(T_max=epochs, eta_min=1e-5), stepped per epoch.
-    lr_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=hp.epochs, eta_min=hp.lr_eta_min,
-    )
-
-    # FlowMM: maintain EMA shadow weights (decay=0.999). These are
-    # swapped in for the final test sampling (FlowMM convention).
-    ema = EMAState(model, hp.ema_decay)
+    # Optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=hp.lr, weight_decay=hp.weight_decay)
 
     base_lattice = InformedLatticeDistribution(
-        hp.mp20_length_log_means, hp.mp20_length_log_stds,
-        hp.angle_low_deg, hp.angle_high_deg,
+        hp.mp20_length_log_means, hp.mp20_length_log_stds
     )
 
     total_steps = hp.epochs * len(train_loader)
-    print0(f"[sched] total_steps={total_steps}  cosine(eta_min={hp.lr_eta_min})  ema_decay={hp.ema_decay}")
+    print0(f"[sched] total_steps={total_steps}  warmup={hp.warmup_steps}")
 
     step = 0
     smooth_loss = 0.0
@@ -883,13 +629,14 @@ def main():
         for batch in train_loader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
+            for g in optimizer.param_groups:
+                g["lr"] = cosine_lr(step, total_steps, hp.warmup_steps, hp.lr)
+
             optimizer.zero_grad(set_to_none=True)
             loss, metrics = flow_matching_loss(model, batch, base_lattice, hp)
             loss.backward()
-            # FlowMM gradient_clip_algorithm='value'.
-            torch.nn.utils.clip_grad_value_(model.parameters(), hp.grad_clip)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), hp.grad_clip)
             optimizer.step()
-            ema.update(model)
 
             smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * metrics["loss"]
             debiased = smooth_loss / (1 - ema_beta ** (step + 1))
@@ -901,12 +648,7 @@ def main():
                 )
             step += 1
 
-        # End-of-epoch: step LR scheduler (interval='epoch').
-        lr_sched.step()
-
-    # Final test sampling: swap in EMA weights (FlowMM convention) and
-    # write one CIF per test entry.
-    ema.apply_to(model)
+    # Final test sampling: write one CIF per test entry.
     samples_dir = _write_test_samples(
         model=model,
         hp=hp,
@@ -915,7 +657,7 @@ def main():
         out_dir=out_dir,
         print0=print0,
     )
-    print0(f"[done] test samples → {samples_dir} (EMA weights)")
+    print0(f"[done] test samples → {samples_dir}")
     print0(f"Run: python evaluate.py --samples_dir {samples_dir}")
 
 
