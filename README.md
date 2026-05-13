@@ -34,6 +34,7 @@ PRs that beat the current METRe under the 12 h budget are appended below.
 
 | # | METRe ↑ | Description | Date | Time | Script | Contributors |
 | - | - | - | - | - | - | - |
+| 1 | 67.93% | Baseline: reproduce [DiffCSP](https://arxiv.org/abs/2309.04475), DDPM diffusion on CSPNet | 05/13/26 | 711 min | [Script](https://github.com/kiyoung98/NanoCSP/blob/86751daac2632c924199107bbfa85103b5b81c15/train.py) | [@kiyoung98](https://github.com/kiyoung98) |
 
 ## Submission
 
